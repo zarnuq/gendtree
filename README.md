@@ -1,66 +1,65 @@
 # gendtree
 
-A terminal (TUI) dependency-graph browser for **Gentoo Portage**.
+A graphical dependency browser for **Gentoo Portage**, shipped as a single
+binary.
 
-Explore the dependency tree — deps of deps of deps — of every package in your
-`@world` set, or search for any package (installed or not) and walk its tree
-interactively. You can also flip a package around to see its *reverse*
-dependencies (what depends on it).
+Start from your `@world` set, or search for any package (installed or not), and
+walk its dependencies column by column: each column lists what the package
+selected in the column to its left depends on. A side panel shows details for
+the selected package, including **why it is installed** (the shortest chain of
+dependencies back to `@world`) and **what requires it**.
 
-## Requirements
-
-Any Gentoo system. That's it:
-
-- **Portage** (provides the `portage` Python module — already installed on Gentoo).
-- Python 3 with `curses` (part of the standard library).
-
-No pip installs, no external libraries. If you launch it with a Python that
-doesn't have the `portage` module, gendtree automatically re-execs into one that
-does.
-
-## Usage
+## Build
 
 ```sh
-./gendtree.py
+cargo build --release
+./target/release/gendtree
 ```
 
-or
+The result is one self-contained binary with no Python and no Portage API
+dependency. It only needs libc at link time; OpenGL and Wayland/X11 are loaded
+at runtime.
 
-```sh
-python3 gendtree.py
-```
-
-It opens on your `@world` set. Move to a package and press `enter`/`→` to load
-and reveal its dependencies; keep expanding to go deeper.
-
-## Keys
+## Using it
 
 | Key | Action |
 | --- | --- |
-| `↑`/`↓`, `k`/`j` | move cursor |
-| `PgUp`/`PgDn` | page up / down |
-| `g` / `G` | jump to top / bottom |
-| `space` / `→` / `l` | open the dependency tree (deps of deps) |
-| `←` / `h` | collapse, or move to parent |
-| `enter` | reverse deps — what depends on the selected package |
-| `E` | expand the whole subtree (bounded depth) |
-| `/` | search: show any package's dep tree (not just `@world`) |
-| `w` | back to the `@world` view |
-| `?` | help |
-| `q` | quit |
+| `↑`/`↓`, `k`/`j`, `PgUp`/`PgDn`, `g`/`G` | move within a column |
+| `→` / `l` | step into the dependencies of the selection |
+| `←` / `h` | step back a column |
+| `Enter` or double-click | *explore from here*: make the package the root |
+| `Backspace` | previous view |
+| `/` or `Ctrl+F` | search all packages; `Enter` picks the top result |
+| `Esc` | leave the search box |
 
-## Legend
+The **Show** toggles in the top bar filter by dependency type. Each row has
+chips for its types: `R` runtime (RDEPEND), `D` build (DEPEND), `B` build tool
+(BDEPEND), `P` post (PDEPEND) and `I` install (IDEPEND). **Installed only**
+hides packages that aren't installed.
 
-- `▸` collapsed / `▾` expanded / `↺` cycle (dependency loops back to an ancestor)
-- `↩` a reverse-dependency subtree root
-- dim text = the dependency atom is **not installed**
+In the columns, italic dim names are not installed, red names are atoms that no
+package matches, and `cycle` marks a package that is already open to the left.
 
 ## How it works
 
-- The `@world` set is read from `$EROOT/var/lib/portage/world`.
-- Dependencies come from installed-package metadata (`RDEPEND`, `DEPEND`,
-  `BDEPEND`, `PDEPEND`), reduced against the package's actual `USE` flags, so you
-  see the deps that really apply to your system. Packages not installed fall
-  back to ebuild metadata.
-- Reverse dependencies are computed by indexing all installed packages the first
-  time you request them (a one-off pass; progress is shown at the bottom).
+gendtree reads Portage's on-disk databases directly:
+
+- **Installed packages**: `/var/db/pkg/<cat>/<pf>/`. Portage has already
+  evaluated the USE conditionals in these `*DEPEND` files, so you see the deps
+  that really apply to your system.
+- **Available packages**: each repo in `repos.conf`, via
+  `metadata/md5-cache`. For overlays without a cache, it reads variable
+  assignments straight out of the `.ebuild`. That parse is best effort and is
+  flagged as approximate in the UI.
+- **USE flags for packages that aren't installed**: the `USE` value in
+  `make.conf` plus the ebuild's `IUSE` defaults. Profile USE isn't applied.
+- **`|| ( … )` groups** resolve to the first alternative that is installed,
+  falling back to the first alternative.
+- **Atoms** resolve to the newest installed match, else the newest available
+  one. Keyworded versions win over live `9999` ebuilds. Masks and
+  `ACCEPT_KEYWORDS` are not evaluated, and sub-slots are ignored.
+- **The reverse-dependency index** is built over all installed packages at
+  startup, which takes about 0.1 s with a warm cache.
+
+`gendtree.py` is the older curses TUI version, which uses the `portage` Python
+module.

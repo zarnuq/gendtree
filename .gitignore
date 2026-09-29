@@ -1,2 +1,8 @@
 .claude
 __pycache__
+
+
+# Added by cargo
+
+/target
+/target
