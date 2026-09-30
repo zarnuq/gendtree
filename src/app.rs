@@ -1,6 +1,8 @@
-//! The egui front end: a column browser (each column lists the dependencies
-//! of the package selected in the column to its left) plus a details panel.
+//! The egui front end: a dependency browser with two views, a collapsible
+//! tree and columns (each column lists the dependencies of the package
+//! selected in the column to its left), plus a details panel.
 
+use std::collections::HashSet;
 use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
 use std::time::Duration;
@@ -14,6 +16,8 @@ use crate::db::{Db, Dep, Id, ALL_KINDS, BDEP, DEP, IDEP, PDEP, RDEP};
 
 const COL_W: f32 = 280.0;
 const ROW_H: f32 = 40.0;
+const TREE_ROW_H: f32 = 26.0;
+const INDENT: f32 = 16.0;
 
 /// (bit, letter, short name, portage variable, colour)
 const KINDS: [(u8, &str, &str, &str, Color32); 5] = [
@@ -24,7 +28,7 @@ const KINDS: [(u8, &str, &str, &str, Color32); 5] = [
     (IDEP, "I", "install", "IDEPEND", Color32::from_rgb(0x26, 0xa6, 0x9a)),
 ];
 
-#[derive(Clone, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum Sel {
     Pkg(Id),
     /// A dependency that matches no known package.
@@ -37,7 +41,7 @@ impl Sel {
     }
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum Root {
     World,
     Pkg(Id),
@@ -50,19 +54,44 @@ struct Column {
     ancestors: Vec<Id>,
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum View {
+    Tree,
+    Columns,
+}
+
+/// One visible line of the tree view.
+struct TreeRow {
+    depth: usize,
+    dep: Dep,
+    /// Selections from the root down to and including this row.
+    path: Vec<Sel>,
+    /// The package already appears higher up; it isn't expanded again here.
+    dup: bool,
+    /// Number of dependencies shown under the current filters.
+    children: usize,
+    open: bool,
+}
+
 pub struct App {
     loading: Option<Receiver<Result<Db, String>>>,
     db: Option<Db>,
     error: Option<String>,
 
+    view: View,
     root: Root,
-    /// `path[i]` is the selection in column `i`.
+    /// `path[i]` is the selection in column `i`; in the tree, the path from
+    /// the root to the selected row.
     path: Vec<Sel>,
     /// The column the keyboard is acting on.
     focus: usize,
     history: Vec<(Root, Vec<Sel>, usize)>,
+    /// Open tree nodes, by their path from the root.
+    expanded: HashSet<(Root, Vec<Sel>)>,
 
     kinds: u8,
+    /// The kind filter of the view that isn't showing; each view keeps its own.
+    other_kinds: u8,
     installed_only: bool,
     query: String,
     results: Vec<String>,
@@ -85,11 +114,15 @@ impl App {
             loading: Some(rx),
             db: None,
             error: None,
+            view: View::Tree,
             root: Root::World,
             path: Vec::new(),
             focus: 0,
             history: Vec::new(),
-            kinds: RDEP | DEP | BDEP | PDEP | IDEP,
+            expanded: HashSet::new(),
+            // The tree starts with runtime deps only; build deps roughly double it.
+            kinds: RDEP | PDEP,
+            other_kinds: ALL_KINDS,
             installed_only: false,
             query: String::new(),
             results: Vec::new(),
@@ -105,6 +138,7 @@ impl App {
         self.root = root;
         self.focus = path.len().saturating_sub(1);
         self.path = path;
+        self.expand_to_selection();
         self.query.clear();
         self.scroll_to_sel = true;
         self.reveal_col = Some(self.focus + 1);
@@ -148,14 +182,7 @@ impl App {
         };
         let mut ancestors: Vec<Id> = parent.into_iter().collect();
         let filter = |db: &Db, items: &Arc<Vec<Dep>>| -> Vec<Dep> {
-            items
-                .iter()
-                .filter(|d| {
-                    (d.kinds == 0 || d.kinds & kinds != 0)
-                        && (!installed_only || d.target.is_some_and(|t| db.pkgs[t].installed()))
-                })
-                .cloned()
-                .collect()
+            items.iter().filter(|d| shown(db, d, kinds, installed_only)).cloned().collect()
         };
         let mut cols = vec![Column { parent, items: filter(db, &first), ancestors: ancestors.clone() }];
         let mut keep = 0;
@@ -177,11 +204,50 @@ impl App {
         cols
     }
 
+    /// Open every tree node above the selection so it is visible.
+    fn expand_to_selection(&mut self) {
+        for i in 1..self.path.len() {
+            self.expanded.insert((self.root, self.path[..i].to_vec()));
+        }
+    }
+
+    fn set_view(&mut self, view: View) {
+        if view == self.view {
+            return;
+        }
+        self.view = view;
+        std::mem::swap(&mut self.kinds, &mut self.other_kinds);
+        self.focus = self.path.len().saturating_sub(1);
+        self.expand_to_selection();
+        self.scroll_to_sel = true;
+        self.reveal_col = Some(self.focus + 1);
+    }
+
+    /// Flatten the open part of the tree into rows, and trim the selection to
+    /// the deepest row that is still visible.
+    fn tree_rows(&mut self) -> Vec<TreeRow> {
+        let (kinds, installed_only, root) = (self.kinds, self.installed_only, self.root);
+        let db = self.db.as_mut().unwrap();
+        let (top, mut seen) = match root {
+            Root::World => (db.world.clone(), HashSet::new()),
+            Root::Pkg(id) => (db.deps(id), HashSet::from([id])),
+        };
+        let mut rows = Vec::new();
+        let mut walk = Walk { db, expanded: &self.expanded, root, kinds, installed_only, seen: &mut seen, rows: &mut rows };
+        walk.add(&top, &mut Vec::new(), 0);
+
+        while !self.path.is_empty() && !rows.iter().any(|r| r.path == self.path) {
+            self.path.pop();
+        }
+        self.focus = self.path.len().saturating_sub(1);
+        rows
+    }
+
     // ------------------------------------------------------------------ //
     // Keyboard
     // ------------------------------------------------------------------ //
 
-    fn handle_keys(&mut self, ctx: &egui::Context, cols: &[Column]) {
+    fn handle_keys(&mut self, ctx: &egui::Context, cols: &[Column], rows: &[TreeRow]) {
         if ctx.egui_wants_keyboard_input() {
             if ctx.input(|i| i.key_pressed(Key::Escape)) {
                 self.query.clear();
@@ -189,36 +255,92 @@ impl App {
             }
             return;
         }
+        match self.view {
+            View::Tree => self.tree_keys(ctx, rows),
+            View::Columns => self.column_keys(ctx, cols),
+        }
+        let pressed = |k: Key| ctx.input(|i| i.key_pressed(k));
+        if pressed(Key::Enter) {
+            if let Some(Sel::Pkg(id)) = self.path.get(self.focus).cloned() {
+                self.set_root(Root::Pkg(id), Vec::new());
+            }
+        }
+        if pressed(Key::Backspace) {
+            self.go_back();
+        }
+        if pressed(Key::Slash) || ctx.input(|i| i.modifiers.command && i.key_pressed(Key::F)) {
+            self.focus_search = true;
+        }
+    }
+
+    /// Up/down/home/end/page keys: the row to move to in a list of `n`.
+    fn step_key(ctx: &egui::Context, cur: Option<usize>, n: usize) -> Option<usize> {
+        let pressed = |k: Key| ctx.input(|i| i.key_pressed(k));
+        let delta: isize = if pressed(Key::ArrowDown) || pressed(Key::J) {
+            1
+        } else if pressed(Key::ArrowUp) || pressed(Key::K) {
+            -1
+        } else if pressed(Key::PageDown) {
+            15
+        } else if pressed(Key::PageUp) {
+            -15
+        } else if pressed(Key::Home) || pressed(Key::G) && !ctx.input(|i| i.modifiers.shift) {
+            isize::MIN / 2
+        } else if pressed(Key::End) || pressed(Key::G) {
+            isize::MAX / 2
+        } else {
+            return None;
+        };
+        if n == 0 {
+            return None;
+        }
+        Some(match cur {
+            Some(c) => (c as isize + delta).clamp(0, n as isize - 1) as usize,
+            None => 0,
+        })
+    }
+
+    fn tree_keys(&mut self, ctx: &egui::Context, rows: &[TreeRow]) {
+        let pressed = |k: Key| ctx.input(|i| i.key_pressed(k));
+        let cur = rows.iter().position(|r| r.path == self.path);
+        let mut goto = Self::step_key(ctx, cur, rows.len());
+
+        if pressed(Key::ArrowRight) || pressed(Key::L) {
+            match cur.map(|c| (c, &rows[c])) {
+                // Jump to where the package is shown in full.
+                Some((_, r)) if r.dup => goto = rows.iter().position(|x| !x.dup && x.dep.target == r.dep.target),
+                Some((c, r)) if r.open => goto = Some(c + 1),
+                Some((_, r)) if r.children > 0 => {
+                    self.expanded.insert((self.root, r.path.clone()));
+                }
+                Some(_) => {}
+                None => goto = (!rows.is_empty()).then_some(0),
+            }
+        }
+        if pressed(Key::ArrowLeft) || pressed(Key::H) {
+            match cur.map(|c| &rows[c]) {
+                Some(r) if r.open => {
+                    self.expanded.remove(&(self.root, r.path.clone()));
+                }
+                _ if self.path.len() > 1 => {
+                    self.path.pop();
+                    self.scroll_to_sel = true;
+                }
+                _ => {}
+            }
+        }
+        if let Some(i) = goto {
+            self.path = rows[i].path.clone();
+            self.scroll_to_sel = true;
+        }
+        self.focus = self.path.len().saturating_sub(1);
+    }
+
+    fn column_keys(&mut self, ctx: &egui::Context, cols: &[Column]) {
         let pressed = |k: Key| ctx.input(|i| i.key_pressed(k));
         let col = &cols[self.focus];
         let cur = self.path.get(self.focus).and_then(|s| col.items.iter().position(|d| Sel::of(d) == *s));
-
-        let step = |delta: isize| -> Option<usize> {
-            if col.items.is_empty() {
-                return None;
-            }
-            let n = col.items.len() as isize;
-            Some(match cur {
-                Some(c) => (c as isize + delta).clamp(0, n - 1) as usize,
-                None => 0,
-            })
-        };
-        let mv = if pressed(Key::ArrowDown) || pressed(Key::J) {
-            step(1)
-        } else if pressed(Key::ArrowUp) || pressed(Key::K) {
-            step(-1)
-        } else if pressed(Key::PageDown) {
-            step(15)
-        } else if pressed(Key::PageUp) {
-            step(-15)
-        } else if pressed(Key::Home) || pressed(Key::G) && !ctx.input(|i| i.modifiers.shift) {
-            step(isize::MIN / 2)
-        } else if pressed(Key::End) || pressed(Key::G) {
-            step(isize::MAX / 2)
-        } else {
-            None
-        };
-        if let Some(i) = mv {
+        if let Some(i) = Self::step_key(ctx, cur, col.items.len()) {
             let sel = Sel::of(&col.items[i]);
             self.path.truncate(self.focus);
             self.path.push(sel);
@@ -242,17 +364,6 @@ impl App {
             self.path.truncate(self.focus + 1);
             self.scroll_to_sel = true;
         }
-        if pressed(Key::Enter) {
-            if let Some(Sel::Pkg(id)) = self.path.get(self.focus).cloned() {
-                self.set_root(Root::Pkg(id), Vec::new());
-            }
-        }
-        if pressed(Key::Backspace) {
-            self.go_back();
-        }
-        if pressed(Key::Slash) || ctx.input(|i| i.modifiers.command && i.key_pressed(Key::F)) {
-            self.focus_search = true;
-        }
     }
 
     // ------------------------------------------------------------------ //
@@ -275,6 +386,13 @@ impl App {
             {
                 self.set_root(Root::World, Vec::new());
             }
+            ui.separator();
+            let mut view = self.view;
+            ui.selectable_value(&mut view, View::Tree, "Tree").on_hover_text("Expandable tree of dependencies");
+            ui.selectable_value(&mut view, View::Columns, "Columns")
+                .on_hover_text("One column per level, like a file browser");
+            self.set_view(view);
+            ui.separator();
             let search = ui.add(
                 egui::TextEdit::singleline(&mut self.query)
                     .id(egui::Id::new("search"))
@@ -407,6 +525,62 @@ impl App {
         }
     }
 
+    fn tree_view(&mut self, ui: &mut Ui, rows: &[TreeRow]) {
+        let db = self.db.as_ref().unwrap();
+        if rows.is_empty() {
+            ui.add_space(12.0);
+            ui.label(RichText::new("No dependencies (with the current filters)").weak());
+            return;
+        }
+        let scroll_to_sel = std::mem::take(&mut self.scroll_to_sel);
+        let sel = rows.iter().position(|r| r.path == self.path);
+        let mut toggle: Option<usize> = None;
+        let mut pick: Option<(usize, bool)> = None;
+
+        egui::ScrollArea::vertical().id_salt(("tree", self.root)).auto_shrink(false).show_viewport(ui, |ui, view| {
+            ui.set_height(TREE_ROW_H * rows.len() as f32);
+            let area = ui.max_rect();
+            let row_rect = |i: usize| {
+                egui::Rect::from_min_size(
+                    egui::pos2(area.left(), area.top() + i as f32 * TREE_ROW_H),
+                    egui::vec2(area.width(), TREE_ROW_H),
+                )
+            };
+            let first = (view.min.y / TREE_ROW_H).floor().max(0.0) as usize;
+            let last = ((view.max.y / TREE_ROW_H).ceil() as usize + 1).min(rows.len());
+            for i in first..last {
+                let (resp, on_toggle) = tree_row(ui, db, row_rect(i), &rows[i], sel == Some(i), self.root);
+                if on_toggle {
+                    toggle = Some(i);
+                } else if resp.double_clicked() {
+                    pick = Some((i, true));
+                } else if resp.clicked() {
+                    pick = Some((i, false));
+                }
+            }
+            if let (true, Some(i)) = (scroll_to_sel, sel) {
+                ui.scroll_to_rect(row_rect(i), None);
+            }
+        });
+
+        if let Some(i) = toggle {
+            let key = (self.root, rows[i].path.clone());
+            if !self.expanded.remove(&key) {
+                self.expanded.insert(key);
+            }
+        }
+        match pick {
+            Some((i, true)) if rows[i].dep.target.is_some() => {
+                self.set_root(Root::Pkg(rows[i].dep.target.unwrap()), Vec::new());
+            }
+            Some((i, _)) => {
+                self.path = rows[i].path.clone();
+                self.focus = self.path.len() - 1;
+            }
+            None => {}
+        }
+    }
+
     fn search_view(&mut self, ui: &mut Ui) {
         let db = self.db.as_ref().unwrap();
         if self.results_for != self.query {
@@ -453,12 +627,14 @@ impl App {
             ui.heading("@world");
             ui.label(format!("{} packages you installed explicitly.", db.world.len()));
             ui.add_space(8.0);
-            ui.label(RichText::new(
-                "Select a package to see what it depends on. Each column to the right \
-                 lists the dependencies of the package selected to its left.",
-            ).weak());
+            ui.label(RichText::new(match self.view {
+                View::Tree => "Select a package to see what it depends on. Click ⏵ or press ➡ \
+                               to open a package's dependencies beneath it.",
+                View::Columns => "Select a package to see what it depends on. Each column to the right \
+                                  lists the dependencies of the package selected to its left.",
+            }).weak());
             ui.add_space(8.0);
-            legend(ui);
+            legend(ui, self.view);
             return;
         };
         let id = match sel {
@@ -615,9 +791,10 @@ impl App {
                 db.world.len()
             )).weak());
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                ui.label(RichText::new(
-                    "↑↓ move   → open   ← back   Enter explore from here   Backspace previous view   / search",
-                ).weak());
+                ui.label(RichText::new(match self.view {
+                    View::Tree => "⬆⬇ move   ➡ expand   ⬅ collapse   Enter explore from here   Backspace previous view   / search",
+                    View::Columns => "⬆⬇ move   ➡ open   ⬅ back   Enter explore from here   Backspace previous view   / search",
+                }).weak());
             });
         });
     }
@@ -657,9 +834,12 @@ impl eframe::App for App {
         }
 
         let searching = !self.query.trim().is_empty();
+        let rows = |app: &mut App| if app.view == View::Tree { app.tree_rows() } else { Vec::new() };
         let cols = self.columns();
-        self.handle_keys(ui.ctx(), &cols);
+        let tree = rows(self);
+        self.handle_keys(ui.ctx(), &cols, &tree);
         let cols = self.columns();
+        let tree = rows(self);
 
         egui::Panel::top("top").show(ui, |ui| {
             ui.add_space(4.0);
@@ -676,7 +856,10 @@ impl eframe::App for App {
             } else {
                 self.breadcrumb(ui);
                 ui.add_space(2.0);
-                self.columns_view(ui, &cols);
+                match self.view {
+                    View::Tree => self.tree_view(ui, &tree),
+                    View::Columns => self.columns_view(ui, &cols),
+                }
             }
         });
     }
@@ -685,6 +868,148 @@ impl eframe::App for App {
 // --------------------------------------------------------------------------- //
 // Widgets
 // --------------------------------------------------------------------------- //
+
+/// Whether the kind and installed filters let a dependency through.
+fn shown(db: &Db, d: &Dep, kinds: u8, installed_only: bool) -> bool {
+    (d.kinds == 0 || d.kinds & kinds != 0) && (!installed_only || d.target.is_some_and(|t| db.pkgs[t].installed()))
+}
+
+/// Depth-first walk of the open part of the tree.
+struct Walk<'a> {
+    db: &'a mut Db,
+    expanded: &'a HashSet<(Root, Vec<Sel>)>,
+    root: Root,
+    kinds: u8,
+    installed_only: bool,
+    /// Packages already given a row; later rows for them are `dup`.
+    seen: &'a mut HashSet<Id>,
+    rows: &'a mut Vec<TreeRow>,
+}
+
+impl Walk<'_> {
+    fn add(&mut self, items: &[Dep], path: &mut Vec<Sel>, depth: usize) {
+        for d in items {
+            if !shown(self.db, d, self.kinds, self.installed_only) {
+                continue;
+            }
+            path.push(Sel::of(d));
+            let dup = d.target.is_some_and(|t| !self.seen.insert(t));
+            let deps = d.target.filter(|_| !dup).map(|t| self.db.deps(t));
+            let children = deps.as_ref().map_or(0, |deps| {
+                deps.iter().filter(|c| shown(self.db, c, self.kinds, self.installed_only)).count()
+            });
+            let open = children > 0 && self.expanded.contains(&(self.root, path.clone()));
+            self.rows.push(TreeRow { depth, dep: d.clone(), path: path.clone(), dup, children, open });
+            if let (true, Some(deps)) = (open, deps) {
+                self.add(&deps, path, depth + 1);
+            }
+            path.pop();
+        }
+    }
+}
+
+/// Draws one tree row; returns its response and whether the expand arrow was clicked.
+fn tree_row(ui: &mut Ui, db: &Db, rect: egui::Rect, r: &TreeRow, selected: bool, root: Root) -> (egui::Response, bool) {
+    let resp = ui.interact(rect, ui.id().with(&r.path), Sense::click());
+    if !ui.is_rect_visible(rect) {
+        return (resp, false);
+    }
+    let v = ui.visuals();
+    let painter = ui.painter_at(rect);
+    let inner = rect.shrink2(egui::vec2(3.0, 1.0));
+    let bg = if selected {
+        v.selection.bg_fill
+    } else if resp.hovered() {
+        v.widgets.hovered.weak_bg_fill
+    } else {
+        Color32::TRANSPARENT
+    };
+    painter.rect_filled(inner, CornerRadius::same(5), bg);
+
+    let strong = if selected { v.selection.stroke.color } else { v.strong_text_color() };
+    let weak = if selected { v.selection.stroke.color.gamma_multiply(0.75) } else { v.weak_text_color() };
+
+    // Faint guide lines, one per level, under the parent's arrow.
+    let guide = v.widgets.noninteractive.bg_stroke.color;
+    for level in 0..r.depth {
+        let x = rect.left() + 14.0 + level as f32 * INDENT;
+        painter.vline(x, rect.y_range(), Stroke::new(1.0, guide));
+    }
+
+    // Expand arrow.
+    let x0 = rect.left() + 8.0 + r.depth as f32 * INDENT;
+    let mid = rect.center().y;
+    let has_arrow = r.children > 0;
+    let arrow_hit = egui::Rect::from_x_y_ranges(rect.left()..=x0 + 14.0, rect.y_range());
+    if has_arrow {
+        let c = egui::pos2(x0 + 6.0, mid);
+        let hot = resp.hover_pos().is_some_and(|p| arrow_hit.contains(p));
+        let color = if hot { strong } else { weak };
+        let pts = if r.open {
+            vec![c + egui::vec2(-4.0, -2.0), c + egui::vec2(4.0, -2.0), c + egui::vec2(0.0, 3.0)]
+        } else {
+            vec![c + egui::vec2(-2.0, -4.0), c + egui::vec2(3.0, 0.0), c + egui::vec2(-2.0, 4.0)]
+        };
+        painter.add(egui::Shape::convex_polygon(pts, color, Stroke::NONE));
+    }
+
+    // One small dot in the colour of the main dependency kind.
+    if let Some(&(_, _, _, _, color)) = KINDS.iter().find(|k| r.dep.kinds & k.0 != 0) {
+        painter.circle_filled(egui::pos2(x0 + 20.0, mid), 3.0, color.gamma_multiply(0.85));
+    }
+
+    // Right-hand side: `⬆` for a repeat, or the child count while collapsed.
+    let mut right = inner.right() - 8.0;
+    let marker = if r.dup {
+        Some(("⬆".to_string(), FontId::proportional(11.0)))
+    } else if has_arrow && !r.open {
+        Some((r.children.to_string(), FontId::proportional(11.0)))
+    } else {
+        None
+    };
+    if let Some((text, font)) = marker {
+        let m = painter.text(egui::pos2(right, mid), Align2::RIGHT_CENTER, text, font, weak);
+        right = m.left() - 8.0;
+    }
+
+    let installed = r.dep.target.is_some_and(|t| db.pkgs[t].installed());
+    let (name, color) = match r.dep.target {
+        None => (r.dep.atom.clone(), v.error_fg_color),
+        Some(t) => (db.pkgs[t].name().to_string(), if installed && !r.dup { strong } else { weak }),
+    };
+    let left = x0 + 30.0;
+    let mut job = LayoutJob::single_section(name, TextFormat {
+        font_id: FontId::proportional(14.0),
+        color,
+        italics: !installed && r.dep.target.is_some(),
+        ..Default::default()
+    });
+    job.wrap = TextWrapping::truncate_at_width((right - left).max(20.0));
+    let galley = painter.layout_job(job);
+    painter.galley(egui::pos2(left, mid - galley.size().y / 2.0), galley, color);
+
+    let mut tip = match r.dep.target {
+        Some(t) => format!("{}\n{}  ·  {}", r.dep.atom, db.pkgs[t].category(), db.pkgs[t].ver.full),
+        None => format!("{}\nNo matching package", r.dep.atom),
+    };
+    let kinds: Vec<&str> = KINDS.iter().filter(|k| r.dep.kinds & k.0 != 0).map(|k| k.2).collect();
+    if !kinds.is_empty() {
+        tip += &format!("\n{} dependency", kinds.join(", "));
+    }
+    if !installed && r.dep.target.is_some() {
+        tip += "\nNot installed";
+    }
+    if let (true, Some(t)) = (r.dup, r.dep.target) {
+        let ancestors = &r.path[..r.path.len() - 1];
+        tip += if root == Root::Pkg(t) || ancestors.contains(&Sel::Pkg(t)) {
+            "\nDependency cycle: this package is above it in the tree"
+        } else {
+            "\nAlready shown higher up (➡ jumps there)"
+        };
+    }
+    let toggled = has_arrow && resp.clicked() && resp.interact_pointer_pos().is_some_and(|p| arrow_hit.contains(p));
+    (resp.on_hover_text(tip), toggled)
+}
 
 fn column_header(ui: &mut Ui, db: &Db, col: &Column) {
     ui.add_space(4.0);
@@ -793,7 +1118,7 @@ fn kind_chips_ui(ui: &mut Ui, kinds: u8) {
     }
 }
 
-fn legend(ui: &mut Ui) {
+fn legend(ui: &mut Ui, view: View) {
     ui.label(RichText::new("Legend").strong());
     for &(_, letter, name, var, color) in &KINDS {
         ui.horizontal(|ui| {
@@ -809,10 +1134,24 @@ fn legend(ui: &mut Ui) {
         ui.label(RichText::new("pkg").color(ui.visuals().error_fg_color));
         ui.label("no package matches");
     });
-    ui.horizontal(|ui| {
-        ui.label(RichText::new("cycle").small().weak());
-        ui.label("already open to the left");
-    });
+    match view {
+        View::Tree => {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("⬆").small().weak());
+                ui.label("already shown higher up");
+            });
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("12").small().weak());
+                ui.label("dependencies inside, when collapsed");
+            });
+        }
+        View::Columns => {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("cycle").small().weak());
+                ui.label("already open to the left");
+            });
+        }
+    }
 }
 
 fn human_size(b: u64) -> String {
