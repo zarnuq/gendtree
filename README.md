@@ -4,8 +4,9 @@ A graphical dependency browser for **Gentoo Portage**, shipped as a single
 binary.
 
 Start from your `@world` set, or search for any package (installed or not), and
-walk its dependencies as an expandable tree, or column by column, where each
-column lists what the package selected in the column to its left depends on.
+walk its dependencies as a tree of package boxes joined by lines, or column by
+column, where each column lists what the package selected in the column to its
+left depends on.
 A side panel shows details for
 the selected package, including **why it is installed** (the shortest chain of
 dependencies back to `@world`) and **what requires it**.
@@ -31,6 +32,7 @@ selection carries over.
 | `↑`/`↓`, `k`/`j`, `PgUp`/`PgDn`, `g`/`G` | move | move within a column |
 | `→` / `l` | expand; if open, go to the first dependency | step into the dependencies of the selection |
 | `←` / `h` | collapse; if closed, go to the parent | step back a column |
+| drag | pan around the tree | |
 
 | Key | Action |
 | --- | --- |
@@ -48,12 +50,19 @@ packages that aren't installed.
 Italic dim names are not installed, and red names are atoms that no package
 matches.
 
-The tree is kept quiet on purpose. Everything starts collapsed, and each row is
-just the name, a dot coloured by its main dependency type, and (when collapsed)
-how many dependencies it has. A package appears in full only the first time;
-later occurrences are dimmed with `⬆` and don't expand (`→` jumps to the full
-one), so common libraries like glibc don't repeat under everything. Click the
-arrow or press `→` to expand; double-click a row to explore from it.
+The tree grows left to right. The root (`@world` or the package you're
+exploring) sits on the left, and each package is a box joined by a line to the
+package that needs it. Each box shows the name, the category, and a strip
+coloured by its main dependency type. The button on a box's right edge shows how
+many dependencies it has. Click a box (or its button, or press `→`) to open its
+dependencies out to the right, and click it again to fold them away. The lines
+from the root to the selected package are highlighted.
+
+Everything starts collapsed, and each box opens on its own: a library that many
+packages need appears under each of them, and each copy can be opened separately.
+The only exception is a dependency cycle, where a package would end up under
+itself. There it is drawn as a dimmed outline whose `⬆` button jumps to the copy
+further up the branch. Double-click a box to explore from it.
 
 In the columns, each row has chips for its dependency types, and `cycle` marks a
 package that is already open to the left.
@@ -81,3 +90,18 @@ gendtree reads Portage's on-disk databases directly:
 
 `gendtree.py` is the older curses TUI version, which uses the `portage` Python
 module.
+
+## Development
+
+`src/app.rs` owns shared navigation state and frame orchestration. The tree,
+columns, and surrounding panels live in `src/app/{tree,columns,panels}.rs`.
+`src/db.rs` handles package resolution and dependency indexing; metadata and
+Portage configuration readers live in `src/db/portage.rs`.
+
+```sh
+cargo test
+cargo clippy --all-targets -- -D warnings
+```
+
+The regular tests use in-memory package graphs and run without Gentoo. On a
+Gentoo system, `cargo test -- --ignored` also exercises the local Portage database.

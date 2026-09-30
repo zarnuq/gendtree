@@ -225,11 +225,9 @@ impl Atom {
             return Some(Atom { cp: s.to_string(), op, ver: None, glob: String::new(), slot });
         }
         let mut glob = String::new();
-        if op == Op::Eq {
-            if let Some(stripped) = s.strip_suffix('*') {
-                s = stripped;
-                op = Op::EqGlob;
-            }
+        if op == Op::Eq && let Some(stripped) = s.strip_suffix('*') {
+            s = stripped;
+            op = Op::EqGlob;
         }
         let (cp, ver) = split_cpv(s)?;
         if op == Op::EqGlob {
