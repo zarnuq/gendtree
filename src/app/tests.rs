@@ -213,3 +213,28 @@ fn switching_views_preserves_the_path_expansion_and_each_views_kind_filter() {
     assert_eq!(app.kinds, DEP);
     assert_eq!(app.path, path(&[1, 2]));
 }
+
+#[test]
+fn only_marks_dependencies_no_other_installed_package_needs() {
+    // 0 is in @world; 3 is shared by 1 and 2; 4 is needed by 1 alone.
+    let mut app = fixture(vec![
+        vec![dep(1, RDEP), dep(2, RDEP)],
+        vec![dep(3, RDEP), dep(4, DEP)],
+        vec![dep(3, RDEP)],
+        vec![],
+        vec![],
+    ]);
+    app.expanded.insert((app.root, path(&[1])));
+
+    let only: Vec<_> = app.tree_rows().iter().map(|r| r.only).collect();
+    // Rows: 1, 1>3, 1>4, 2
+    assert_eq!(only, vec![true, false, true, true]);
+
+    let db = app.db.as_ref().unwrap();
+    assert!(db.only_needed_by(4, 1));
+    assert!(!db.only_needed_by(3, 1));
+    assert!(
+        !db.only_needed_by(0, 1),
+        "@world packages are never orphans"
+    );
+}

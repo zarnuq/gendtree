@@ -140,8 +140,19 @@ impl App {
                                             let cycle = d
                                                 .target
                                                 .is_some_and(|t| col.ancestors.contains(&t));
-                                            let resp =
-                                                dep_row(ui, db, d, is_sel, ci == self.focus, cycle);
+                                            let only = d
+                                                .target
+                                                .zip(col.parent)
+                                                .is_some_and(|(t, p)| db.only_needed_by(t, p));
+                                            let resp = dep_row(
+                                                ui,
+                                                db,
+                                                d,
+                                                is_sel,
+                                                ci == self.focus,
+                                                cycle,
+                                                only,
+                                            );
                                             if is_sel && ci == self.focus && scroll_to_sel {
                                                 resp.scroll_to_me(None);
                                             }
@@ -204,6 +215,7 @@ fn dep_row(
     selected: bool,
     focused: bool,
     cycle: bool,
+    only: bool,
 ) -> egui::Response {
     let (rect, resp) =
         ui.allocate_exact_size(egui::vec2(ui.available_width(), ROW_H), Sense::click());
@@ -240,7 +252,12 @@ fn dep_row(
             let p = &db.pkgs[t];
             (
                 p.name().to_string(),
-                format!("{}  ·  {}", p.category(), p.ver.full),
+                format!(
+                    "{}  ·  {}{}",
+                    p.category(),
+                    p.ver.full,
+                    if only { "  ·  only needed here" } else { "" }
+                ),
                 p.installed(),
             )
         }
@@ -319,6 +336,8 @@ fn dep_row(
 
     let tip = if cycle {
         format!("{}\nAlready open to the left (dependency cycle)", d.atom)
+    } else if only {
+        format!("{}\nNo other installed package needs it", d.atom)
     } else if !installed && d.target.is_some() {
         format!("{}\nNot installed", d.atom)
     } else {

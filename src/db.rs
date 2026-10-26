@@ -436,6 +436,14 @@ impl Db {
         self.rdeps.get(&id).map_or(&[], Vec::as_slice)
     }
 
+    /// Whether `parent` is the only installed package that needs `id` (and
+    /// `id` isn't in @world), so removing `parent` would leave it orphaned.
+    pub fn only_needed_by(&self, id: Id, parent: Id) -> bool {
+        self.pkgs[id].installed()
+            && !self.world_ids.contains(&id)
+            && matches!(self.rdeps(id), [(p, _)] if *p == parent)
+    }
+
     /// Shortest chain `world pkg -> ... -> id` through installed dependencies
     /// of the given kinds.
     pub fn why_installed(&self, id: Id, kinds: u8) -> Option<Vec<Id>> {

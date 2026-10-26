@@ -28,6 +28,8 @@ pub(super) struct TreeRow {
     /// The package is its own ancestor on this branch (a dependency cycle),
     /// so it isn't expanded again here.
     pub(super) cycle: bool,
+    /// Its parent is the only installed package that needs it.
+    pub(super) only: bool,
     /// Number of dependencies shown under the current filters.
     pub(super) children: usize,
     pub(super) open: bool,
@@ -290,6 +292,20 @@ impl Walk<'_> {
             let cycle = d.target.is_some_and(|t| {
                 self.root == Root::Pkg(t) || path[..path.len() - 1].contains(&Sel::Pkg(t))
             });
+            let parent = match path.len() {
+                1 => match self.root {
+                    Root::Pkg(p) => Some(p),
+                    Root::World => None,
+                },
+                n => match path[n - 2] {
+                    Sel::Pkg(p) => Some(p),
+                    Sel::Atom(_) => None,
+                },
+            };
+            let only = d
+                .target
+                .zip(parent)
+                .is_some_and(|(t, p)| self.db.only_needed_by(t, p));
             let deps = d.target.filter(|_| !cycle).map(|t| self.db.deps(t));
             let children = deps.as_ref().map_or(0, |deps| {
                 deps.iter()
@@ -302,6 +318,7 @@ impl Walk<'_> {
                 dep: d.clone(),
                 path: path.clone(),
                 cycle,
+                only,
                 children,
                 open,
             });
@@ -579,6 +596,8 @@ fn tree_node(
                 "  ·  cycle"
             } else if !installed {
                 "  ·  not installed"
+            } else if r.only {
+                "  ·  only needed here"
             } else {
                 ""
             };
@@ -679,6 +698,9 @@ fn tree_node(
     if !installed && r.dep.target.is_some() {
         tip += "\nNot installed";
     }
+    if r.only {
+        tip += "\nNo other installed package needs it";
+    }
     if r.cycle {
         tip += "\nDependency cycle: this package is further up this branch (⬆ or ➡ jumps there)";
     }
@@ -699,6 +721,7 @@ mod tests {
             },
             path: path.iter().copied().map(Sel::Pkg).collect(),
             cycle: false,
+            only: false,
             children: usize::from(open),
             open,
         }
